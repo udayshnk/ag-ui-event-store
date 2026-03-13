@@ -5,6 +5,7 @@ from pydantic import BaseModel
 class Thread(BaseModel):
     thread_id: str
     namespace: Optional[str]
+    agent_id: Optional[str] = None
     title: Optional[str]
     user_message: Optional[str]
     latest_run_id: Optional[str] = None
