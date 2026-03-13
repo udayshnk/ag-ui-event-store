@@ -1,0 +1,27 @@
+[project]
+name = "ag-ui-persistence"
+version = "0.1.0"
+description = "Async Python utility library for persisting AG-UI protocol events, runs, and threads"
+requires-python = ">=3.11"
+dependencies = [
+    "aiosqlite>=0.21.0",
+    "asyncpg>=0.31.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
