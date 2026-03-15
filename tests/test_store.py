@@ -84,12 +84,36 @@ async def test_get_runs_by_parent(store):
 
 
 @pytest.mark.asyncio
+async def test_get_runs_respects_namespace(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None, namespace="project-a")
+    await store.put_run("thread-2", "run-2", parent_run_id=None, namespace="project-b")
+
+    runs = await store.get_runs("thread-1", namespace="project-a")
+    assert [run.run_id for run in runs] == ["run-1"]
+
+    hidden = await store.get_runs("thread-1", namespace="project-b")
+    assert hidden == []
+
+
+@pytest.mark.asyncio
 async def test_update_run_status(store):
     await store.put_run("thread-1", "run-1", parent_run_id=None)
     await store.update_run("run-1", status="completed", summary="Done")
     runs = await store.get_runs("thread-1")
     assert runs[0].status == "completed"
     assert runs[0].summary == "Done"
+
+
+@pytest.mark.asyncio
+async def test_get_run_respects_namespace(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None, namespace="project-a")
+
+    run = await store.get_run("run-1", namespace="project-a")
+    assert run is not None
+    assert run.run_id == "run-1"
+
+    hidden = await store.get_run("run-1", namespace="project-b")
+    assert hidden is None
 
 
 @pytest.mark.asyncio
@@ -113,6 +137,18 @@ async def test_duplicate_event_ignored(store):
     await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})  # duplicate
     events = await store.get_events("run-1")
     assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_events_respects_namespace(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None, namespace="project-a")
+    await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+    events = await store.get_events("run-1", namespace="project-a")
+    assert len(events) == 1
+
+    hidden = await store.get_events("run-1", namespace="project-b")
+    assert hidden == []
 
 
 @pytest.mark.asyncio
@@ -158,4 +194,16 @@ async def test_user_message_not_overwritten(store):
     assert threads[0].user_message == first
     assert threads[0].title == first[:100]
 
+
+@pytest.mark.asyncio
+async def test_delete_thread_respects_namespace(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None, namespace="project-a")
+
+    deleted = await store.delete_thread("thread-1", namespace="project-b")
+    assert deleted is False
+    assert len(await store.get_threads()) == 1
+
+    deleted = await store.delete_thread("thread-1", namespace="project-a")
+    assert deleted is True
+    assert await store.get_threads() == []
 

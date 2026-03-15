@@ -253,15 +253,22 @@ class AGUIEventStore:
         parent_run_id: Optional[str] = None,
         limit: int = 20,
         before: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> list[Run]:
         async with self._engine.connect() as conn:
             params: dict = {"limit": limit}
+            join = ""
+            namespace_filter = ""
+            if namespace is not None:
+                join = " JOIN agui_threads t ON t.thread_id = agui_runs.thread_id"
+                namespace_filter = " AND t.namespace = :ns"
+                params["ns"] = namespace
             if parent_run_id is not None:
-                where = "WHERE thread_id = :tid AND parent_run_id = :prid"
+                where = "WHERE agui_runs.thread_id = :tid AND agui_runs.parent_run_id = :prid"
                 params["tid"] = thread_id
                 params["prid"] = parent_run_id
             else:
-                where = "WHERE thread_id = :tid AND parent_run_id IS NULL"
+                where = "WHERE agui_runs.thread_id = :tid AND agui_runs.parent_run_id IS NULL"
                 params["tid"] = thread_id
 
             if before:
@@ -270,14 +277,16 @@ class AGUIEventStore:
                     {"rid": before},
                 )
                 ts = row.scalar()
-                where += " AND created_at < :ts"
+                where += " AND agui_runs.created_at < :ts"
                 params["ts"] = ts
 
             result = await conn.execute(
                 text(
-                    f"SELECT run_id, thread_id, parent_run_id, previous_run_id, seq, status, title, summary, "
-                    f"created_at, updated_at FROM agui_runs {where} "
-                    f"ORDER BY created_at DESC LIMIT :limit"
+                    "SELECT agui_runs.run_id, agui_runs.thread_id, agui_runs.parent_run_id, "
+                    "agui_runs.previous_run_id, agui_runs.seq, agui_runs.status, agui_runs.title, "
+                    "agui_runs.summary, agui_runs.created_at, agui_runs.updated_at "
+                    f"FROM agui_runs{join} {where}{namespace_filter} "
+                    "ORDER BY agui_runs.created_at DESC LIMIT :limit"
                 ),
                 params,
             )
@@ -297,14 +306,23 @@ class AGUIEventStore:
                 for r in result
             ]
 
-    async def get_run(self, run_id: str) -> Optional[Run]:
+    async def get_run(self, run_id: str, namespace: Optional[str] = None) -> Optional[Run]:
         async with self._engine.connect() as conn:
+            join = ""
+            namespace_filter = ""
+            params = {"rid": run_id}
+            if namespace is not None:
+                join = " JOIN agui_threads t ON t.thread_id = agui_runs.thread_id"
+                namespace_filter = " AND t.namespace = :ns"
+                params["ns"] = namespace
             result = await conn.execute(
                 text(
-                    "SELECT run_id, thread_id, parent_run_id, previous_run_id, seq, status, title, summary, "
-                    "created_at, updated_at FROM agui_runs WHERE run_id = :rid"
+                    "SELECT agui_runs.run_id, agui_runs.thread_id, agui_runs.parent_run_id, "
+                    "agui_runs.previous_run_id, agui_runs.seq, agui_runs.status, agui_runs.title, "
+                    "agui_runs.summary, agui_runs.created_at, agui_runs.updated_at "
+                    f"FROM agui_runs{join} WHERE agui_runs.run_id = :rid{namespace_filter}"
                 ),
-                {"rid": run_id},
+                params,
             )
             r = result.fetchone()
             if r is None:
@@ -322,23 +340,40 @@ class AGUIEventStore:
                 updated_at=r[9],
             )
 
-    async def delete_thread(self, thread_id: str) -> bool:
+    async def delete_thread(self, thread_id: str, namespace: Optional[str] = None) -> bool:
         """Delete a thread and all its runs and events. Returns True if found and deleted."""
         async with self._engine.begin() as conn:
+            query = "DELETE FROM agui_threads WHERE thread_id = :tid"
+            params = {"tid": thread_id}
+            if namespace is not None:
+                query += " AND namespace = :ns"
+                params["ns"] = namespace
             result = await conn.execute(
-                text("DELETE FROM agui_threads WHERE thread_id = :tid"),
-                {"tid": thread_id},
+                text(query),
+                params,
             )
         return result.rowcount > 0
 
-    async def get_events(self, run_id: str) -> list[Event]:
+    async def get_events(self, run_id: str, namespace: Optional[str] = None) -> list[Event]:
         async with self._engine.connect() as conn:
+            join = ""
+            namespace_filter = ""
+            params = {"rid": run_id}
+            if namespace is not None:
+                join = (
+                    " JOIN agui_runs r ON r.run_id = agui_events.run_id"
+                    " JOIN agui_threads t ON t.thread_id = r.thread_id"
+                )
+                namespace_filter = " AND t.namespace = :ns"
+                params["ns"] = namespace
             result = await conn.execute(
                 text(
-                    "SELECT run_id, seq, event_type, data, created_at FROM agui_events "
-                    "WHERE run_id = :rid ORDER BY seq ASC"
+                    "SELECT agui_events.run_id, agui_events.seq, agui_events.event_type, "
+                    "agui_events.data, agui_events.created_at "
+                    f"FROM agui_events{join} WHERE agui_events.run_id = :rid{namespace_filter} "
+                    "ORDER BY agui_events.seq ASC"
                 ),
-                {"rid": run_id},
+                params,
             )
             return [
                 Event(
