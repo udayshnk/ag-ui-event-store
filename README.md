@@ -20,10 +20,10 @@ pip install ag-ui-persistence
 ## Usage
 
 ```python
-from ag_ui_event_store import AGUIEventStore
+from ag_ui_persistence import AGUIPersistence
 
-store = AGUIEventStore("sqlite:///agui.db")
-# or: AGUIEventStore("postgresql://user:pass@localhost/mydb")
+store = AGUIPersistence("sqlite:///agui.db")
+# or: AGUIPersistence("postgresql://user:pass@localhost/mydb")
 await store.initialize()  # creates tables
 
 # During a live agent run
@@ -46,7 +46,7 @@ child_runs = await store.get_runs(thread_id="t1", parent_run_id="r1")
 
 ## API
 
-### `AGUIEventStore(engine)`
+### `AGUIPersistence(engine)`
 
 Accepts a SQLAlchemy URL string or an existing `AsyncEngine`. `sqlite://` and `postgresql://` / `postgres://` prefixes are automatically converted to their async-native equivalents (`sqlite+aiosqlite://`, `postgresql+asyncpg://`).
 

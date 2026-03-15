@@ -59,7 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_agui_runs_parent  ON agui_runs(parent_run_id);
 """
 
 
-class AGUIEventStore:
+class AGUIPersistence:
     def __init__(self, engine: Union[AsyncEngine, str]):
         if isinstance(engine, str):
             self._engine: AsyncEngine = create_async_engine(_normalize_url(engine))

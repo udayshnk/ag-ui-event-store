@@ -1,12 +1,12 @@
-"""Tests for AGUIEventStore using in-memory SQLite."""
+"""Tests for AGUIPersistence using in-memory SQLite."""
 import pytest
 import pytest_asyncio
-from ag_ui_event_store import AGUIEventStore, Thread, Run, Event
+from ag_ui_persistence import AGUIPersistence, Thread, Run, Event
 
 
 @pytest_asyncio.fixture
 async def store():
-    s = AGUIEventStore("sqlite:///:memory:")
+    s = AGUIPersistence("sqlite:///:memory:")
     await s.initialize()
     return s
 
