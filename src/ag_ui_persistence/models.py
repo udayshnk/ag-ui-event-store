@@ -31,4 +31,5 @@ class Event(BaseModel):
     seq: int
     event_type: str
     data: dict
-    created_at: int
+    started_at: int
+    ended_at: int

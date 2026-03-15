@@ -1,14 +1,24 @@
 """Tests for AGUIPersistence using in-memory SQLite."""
+import asyncio
 import pytest
 import pytest_asyncio
-from ag_ui_persistence import AGUIPersistence, Thread, Run, Event
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from ag_ui_persistence import AGUIPersistence, PersistenceConfig, Thread, Run, Event
+
+
+def mem_store(**kwargs) -> AGUIPersistence:
+    return AGUIPersistence(PersistenceConfig(db_url="sqlite:///:memory:", **kwargs))
 
 
 @pytest_asyncio.fixture
 async def store():
-    s = AGUIPersistence("sqlite:///:memory:")
+    s = mem_store(persist_on_completion=False, merge_delta_events=False)
     await s.initialize()
-    return s
+    try:
+        yield s
+    finally:
+        await s.close()
 
 
 @pytest.mark.asyncio
@@ -105,6 +115,25 @@ async def test_update_run_status(store):
 
 
 @pytest.mark.asyncio
+async def test_update_run_flushes_buffered_events_before_terminal_status(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None)
+    await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+    await store.update_run("run-1", status="completed", summary="Done")
+
+    async with store._engine.connect() as conn:
+        event_count = await conn.execute(
+            text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+            {"rid": "run-1"},
+        )
+        run_status = await conn.execute(
+            text("SELECT status FROM agui_runs WHERE run_id = :rid"),
+            {"rid": "run-1"},
+        )
+        assert event_count.scalar() == 1
+        assert run_status.scalar() == "completed"
+
+
+@pytest.mark.asyncio
 async def test_get_run_respects_namespace(store):
     await store.put_run("thread-1", "run-1", parent_run_id=None, namespace="project-a")
 
@@ -149,6 +178,322 @@ async def test_get_events_respects_namespace(store):
 
     hidden = await store.get_events("run-1", namespace="project-b")
     assert hidden == []
+
+
+@pytest.mark.asyncio
+async def test_namespace_mismatch_does_not_flush_buffered_events(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None, namespace="project-a")
+    await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+    hidden = await store.get_events("run-1", namespace="project-b")
+    assert hidden == []
+
+    async with store._engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+            {"rid": "run-1"},
+        )
+        assert result.scalar() == 0
+
+
+@pytest.mark.asyncio
+async def test_put_event_is_buffered_until_get_events_flushes(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None)
+    await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+    async with store._engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+            {"rid": "run-1"},
+        )
+        assert result.scalar() == 0
+
+    events = await store.get_events("run-1")
+    assert [event.seq for event in events] == [0]
+
+    async with store._engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+            {"rid": "run-1"},
+        )
+        assert result.scalar() == 1
+
+
+@pytest.mark.asyncio
+async def test_close_flushes_pending_events(tmp_path):
+    db_path = tmp_path / "buffered-close.db"
+    store = AGUIPersistence(PersistenceConfig(db_url=f"sqlite:///{db_path}", persist_on_completion=False))
+    await store.initialize()
+    await store.put_run("thread-1", "run-1", parent_run_id=None)
+    await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+    await store.close()
+
+    async with store._engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+            {"rid": "run-1"},
+        )
+        assert result.scalar() == 1
+
+
+@pytest.mark.asyncio
+async def test_close_disables_store_methods():
+    store = mem_store(enable_event_buffering=False, persist_on_completion=False)
+    await store.initialize()
+    await store.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await store.get_threads()
+
+
+@pytest.mark.asyncio
+async def test_put_event_writes_immediately_when_buffering_disabled():
+    store = mem_store(enable_event_buffering=False, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        async with store._engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+                {"rid": "run-1"},
+            )
+            assert result.scalar() == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_get_events_reads_without_buffer_flush_when_disabled():
+    store = mem_store(enable_event_buffering=False, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        events = await store.get_events("run-1")
+        assert len(events) == 1
+        assert events[0].seq == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_buffered_write_failures_surface_and_poison_future_operations():
+    store = mem_store(persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_event("missing-run", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        with pytest.raises(Exception):
+            await store.get_events("missing-run")
+
+        with pytest.raises(RuntimeError, match="Buffered event write failed"):
+            await store.get_threads()
+    finally:
+        try:
+            await store.close()
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_close_surfaces_prior_buffered_write_failure():
+    store = mem_store(persist_on_completion=False)
+    await store.initialize()
+    await store.put_event("missing-run", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+    with pytest.raises(Exception):
+        await store._flush_all_events()
+
+    with pytest.raises(Exception):
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_multi_run_batch_still_flushes_other_runs():
+    store = mem_store(event_flush_interval=10)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "good-run", parent_run_id=None)
+        await store.put_event("good-run", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.put_event("missing-run", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        with pytest.raises(Exception):
+            await store._flush_all_events()
+
+        async with store._engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+                {"rid": "good-run"},
+            )
+            assert result.scalar() == 1
+    finally:
+        try:
+            await store.close()
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_completed_flusher_task_is_restarted_for_new_flushes():
+    store = mem_store(event_flush_interval=10, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        done_task = asyncio.create_task(asyncio.sleep(0))
+        await done_task
+        store._flusher_task = done_task
+
+        events = await store.get_events("run-1")
+        assert len(events) == 1
+        assert events[0].seq == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_get_events_waits_for_pending_tokens_while_same_run_is_inflight():
+    store = mem_store(event_batch_size=1, event_flush_interval=10, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_flush_batch = store._flush_batch
+
+        async def controlled_flush(batch):
+            if batch["run-1"][0].seq == 0:
+                started.set()
+                await release.wait()
+            await original_flush_batch(batch)
+
+        store._flush_batch = controlled_flush
+
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await started.wait()
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_END", {"threadId": "thread-1"})
+
+        read_task = asyncio.create_task(store.get_events("run-1"))
+        await asyncio.sleep(0)
+        assert not read_task.done()
+
+        release.set()
+        events = await read_task
+        assert [event.seq for event in events] == [0, 1]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_thread_waits_for_inflight_event_batches(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_flush_batch = store._flush_batch
+
+    async def controlled_flush(batch):
+        started.set()
+        await release.wait()
+        await original_flush_batch(batch)
+
+    store._flush_batch = controlled_flush
+
+    await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+    await started.wait()
+
+    delete_task = asyncio.create_task(store.delete_thread("thread-1"))
+    await asyncio.sleep(0)
+    assert not delete_task.done()
+
+    release.set()
+    assert await delete_task is True
+    assert await store.get_threads() == []
+
+
+@pytest.mark.asyncio
+async def test_delete_thread_ignores_unrelated_buffered_runs():
+    store = mem_store(event_flush_interval=10)
+    await store.initialize()
+    try:
+        await store.put_run("thread-a", "run-a", parent_run_id=None)
+        await store.put_run("thread-b", "run-b", parent_run_id=None)
+        await store.put_event("run-a", 0, "RUN_STARTED", {"threadId": "thread-a"})
+        await store.put_event("missing-run", 0, "RUN_STARTED", {"threadId": "thread-b"})
+
+        assert await store.delete_thread("thread-a") is True
+
+        threads = await store.get_threads()
+        assert [thread.thread_id for thread in threads] == ["thread-b"]
+    finally:
+        try:
+            await store.close()
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_dispose_caller_provided_engine():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    store = AGUIPersistence(PersistenceConfig(engine=engine, enable_event_buffering=False))
+    await store.initialize()
+    await store.close()
+
+    async with engine.connect() as conn:
+        result = await conn.execute(text("SELECT COUNT(*) FROM agui_threads"))
+        assert result.scalar() == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_flusher_task_stops_when_buffer_becomes_idle():
+    store = mem_store(persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.get_events("run-1")
+
+        for _ in range(10):
+            if store._flusher_task is None:
+                break
+            await asyncio.sleep(0)
+
+        assert store._flusher_task is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_during_idle_flusher_exit_starts_replacement_flusher():
+    store = mem_store(event_flush_interval=10, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.get_events("run-1")
+
+        old_task = asyncio.create_task(store._event_flusher_loop())
+        async with store._state_lock:
+            store._flusher_task = old_task
+
+        await asyncio.sleep(0)
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_END", {"threadId": "thread-1"})
+        events = await store.get_events("run-1")
+
+        assert [event.seq for event in events] == [0, 1]
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -207,3 +552,371 @@ async def test_delete_thread_respects_namespace(store):
     assert deleted is True
     assert await store.get_threads() == []
 
+
+@pytest.mark.asyncio
+async def test_missing_db_url_and_engine_raises():
+    with pytest.raises(ValueError, match="db_url.*engine"):
+        AGUIPersistence(PersistenceConfig())
+
+
+# ------------------------------------------------------------------
+# persist_on_completion tests
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_events_not_visible_until_complete():
+    store = mem_store(persist_on_completion=True)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_START", {"messageId": "msg-1"})
+
+        # Events are buffered — DB should be empty
+        async with store._engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+                {"rid": "run-1"},
+            )
+            assert result.scalar() == 0
+
+        # get_events should return empty (no flush triggered)
+        events = await store.get_events("run-1")
+        assert events == []
+
+        # DB still empty after get_events
+        async with store._engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+                {"rid": "run-1"},
+            )
+            assert result.scalar() == 0
+
+        # Completing the run triggers flush
+        await store.update_run("run-1", status="completed")
+
+        async with store._engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+                {"rid": "run-1"},
+            )
+            assert result.scalar() == 2
+
+        # Now get_events reads from DB
+        events = await store.get_events("run-1")
+        assert len(events) == 2
+        assert events[0].event_type == "RUN_STARTED"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_flushed_on_error_status():
+    store = mem_store(persist_on_completion=True)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        # error is also a terminal status
+        await store.update_run("run-1", status="error")
+
+        async with store._engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+                {"rid": "run-1"},
+            )
+            assert result.scalar() == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_close_discards_unfinished_runs(tmp_path):
+    db_path = tmp_path / "poc-close.db"
+    store = AGUIPersistence(PersistenceConfig(db_url=f"sqlite:///{db_path}", persist_on_completion=True))
+    await store.initialize()
+    await store.put_run("thread-1", "run-finished", parent_run_id=None)
+    await store.put_run("thread-1", "run-partial", parent_run_id=None)
+    await store.put_event("run-finished", 0, "RUN_STARTED", {})
+    await store.put_event("run-partial", 0, "RUN_STARTED", {})
+    await store.update_run("run-finished", status="completed")
+    # run-partial never reaches terminal status — close() should discard it
+    await store.close()
+
+    async with store._engine.connect() as conn:
+        finished = await conn.execute(
+            text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+            {"rid": "run-finished"},
+        )
+        partial = await conn.execute(
+            text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+            {"rid": "run-partial"},
+        )
+        assert finished.scalar() == 1
+        assert partial.scalar() == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_non_terminal_update_does_not_flush():
+    store = mem_store(persist_on_completion=True)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        # Non-terminal status update — should not flush
+        await store.update_run("run-1", status="running")
+
+        async with store._engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"),
+                {"rid": "run-1"},
+            )
+            assert result.scalar() == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_batch_size_does_not_trigger_early_flush():
+    """Exceeding event_batch_size must not cause a partial write when persist_on_completion=True."""
+    store = mem_store(persist_on_completion=True, event_batch_size=2)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_START", {"messageId": "m1"})
+        # Third event exceeds event_batch_size=2 — must NOT flush early
+        await store.put_event("run-1", 2, "TEXT_MESSAGE_END", {"messageId": "m1"})
+
+        async with store._engine.connect() as conn:
+            count = (await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"), {"rid": "run-1"},
+            )).scalar()
+            assert count == 0
+
+        await store.update_run("run-1", status="completed")
+
+        async with store._engine.connect() as conn:
+            count = (await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"), {"rid": "run-1"},
+            )).scalar()
+            assert count == 3
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_events_and_status_written_atomically():
+    """Events and run status must be visible together — never events without terminal status."""
+    store = mem_store(persist_on_completion=True)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "m1", "delta": "hi"})
+
+        await store.update_run("run-1", status="completed", summary="done")
+
+        # Both events and terminal status must be visible in the same read
+        async with store._engine.connect() as conn:
+            event_count = (await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"), {"rid": "run-1"},
+            )).scalar()
+            run_row = (await conn.execute(
+                text("SELECT status FROM agui_runs WHERE run_id = :rid"), {"rid": "run-1"},
+            )).fetchone()
+
+        assert event_count == 2
+        assert run_row is not None and run_row[0] == "completed"
+    finally:
+        await store.close()
+
+
+# ------------------------------------------------------------------
+# merge_delta_events tests
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_merge_delta_events_text_message_content():
+    store = mem_store(merge_delta_events=True, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "Hello"})
+        await store.put_event("run-1", 2, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": ", "})
+        await store.put_event("run-1", 3, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "world"})
+        await store.put_event("run-1", 4, "TEXT_MESSAGE_END", {"messageId": "msg-1"})
+
+        events = await store.get_events("run-1")
+
+        # 3 deltas collapsed to 1, so total = RUN_STARTED + merged_delta + TEXT_MESSAGE_END = 3
+        assert len(events) == 3
+        assert events[0].event_type == "RUN_STARTED"
+        assert events[1].event_type == "TEXT_MESSAGE_CONTENT"
+        assert events[1].seq == 1  # keeps seq of first delta
+        assert events[1].data["delta"] == "Hello, world"
+        assert events[1].data["messageId"] == "msg-1"
+        assert events[2].event_type == "TEXT_MESSAGE_END"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_delta_events_tool_call_args():
+    store = mem_store(merge_delta_events=True, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "TOOL_CALL_ARGS", {"toolCallId": "tc-1", "delta": '{"key"'})
+        await store.put_event("run-1", 1, "TOOL_CALL_ARGS", {"toolCallId": "tc-1", "delta": ': "val'})
+        await store.put_event("run-1", 2, "TOOL_CALL_ARGS", {"toolCallId": "tc-1", "delta": 'ue"}'})
+
+        events = await store.get_events("run-1")
+
+        assert len(events) == 1
+        assert events[0].event_type == "TOOL_CALL_ARGS"
+        assert events[0].seq == 0
+        assert events[0].data["delta"] == '{"key": "value"}'
+        assert events[0].data["toolCallId"] == "tc-1"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_delta_events_different_message_ids_not_merged():
+    store = mem_store(merge_delta_events=True, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "Hi"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-2", "delta": "Bye"})
+
+        events = await store.get_events("run-1")
+
+        # Different messageIds — not merged
+        assert len(events) == 2
+        assert events[0].data["messageId"] == "msg-1"
+        assert events[1].data["messageId"] == "msg-2"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_delta_events_non_adjacent_same_id_not_merged():
+    """A TEXT_MESSAGE_END between two TEXT_MESSAGE_CONTENT deltas for the same message
+    must prevent them from being merged — the boundary event breaks adjacency."""
+    store = mem_store(merge_delta_events=True, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "Hello"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_END", {"messageId": "msg-1"})
+        await store.put_event("run-1", 2, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "World"})
+
+        events = await store.get_events("run-1")
+
+        assert len(events) == 3
+        assert events[0].data["delta"] == "Hello"
+        assert events[1].event_type == "TEXT_MESSAGE_END"
+        assert events[2].data["delta"] == "World"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_delta_events_across_flush_boundaries():
+    """Deltas split across two flush batches must produce a single merged DB row."""
+    store = mem_store(merge_delta_events=True, event_flush_interval=10, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "Hello"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": ", "})
+        # Force first batch to flush before the next events arrive
+        await store._flush_run("run-1")
+
+        async with store._engine.connect() as conn:
+            count = (await conn.execute(
+                text("SELECT COUNT(*) FROM agui_events WHERE run_id = :rid"), {"rid": "run-1"},
+            )).scalar()
+            assert count == 1  # two deltas already merged into one row
+
+        # Second batch continues the same delta stream
+        await store.put_event("run-1", 2, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "world"})
+        await store.put_event("run-1", 3, "TEXT_MESSAGE_END", {"messageId": "msg-1"})
+
+        events = await store.get_events("run-1")
+
+        assert len(events) == 2  # all three deltas in one row + end
+        assert events[0].seq == 0
+        assert events[0].data["delta"] == "Hello, world"
+        assert events[1].event_type == "TEXT_MESSAGE_END"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_delta_events_disabled_by_default(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None)
+    await store.put_event("run-1", 0, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "Hello"})
+    await store.put_event("run-1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": " world"})
+
+    events = await store.get_events("run-1")
+    assert len(events) == 2  # not merged
+
+
+# ------------------------------------------------------------------
+# started_at / ended_at tests
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_non_delta_events_have_equal_started_at_ended_at(store):
+    await store.put_run("thread-1", "run-1", parent_run_id=None)
+    await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+    await store.put_event("run-1", 1, "TEXT_MESSAGE_START", {"messageId": "msg-1"})
+
+    events = await store.get_events("run-1")
+    for event in events:
+        assert event.started_at == event.ended_at
+        assert event.started_at > 0
+
+
+@pytest.mark.asyncio
+async def test_merged_event_timestamps_span_first_to_last_delta():
+    store = mem_store(merge_delta_events=True, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "a"})
+        await asyncio.sleep(0.01)
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "b"})
+        await asyncio.sleep(0.01)
+        await store.put_event("run-1", 2, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "c"})
+
+        events = await store.get_events("run-1")
+        assert len(events) == 1
+        merged = events[0]
+        # started_at from first delta, ended_at from last — so ended_at >= started_at
+        assert merged.ended_at >= merged.started_at
+        assert merged.data["delta"] == "abc"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_unbuffered_events_have_equal_started_at_ended_at():
+    store = mem_store(enable_event_buffering=False, persist_on_completion=False)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        events = await store.get_events("run-1")
+        assert len(events) == 1
+        assert events[0].started_at == events[0].ended_at
+        assert events[0].started_at > 0
+    finally:
+        await store.close()

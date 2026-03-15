@@ -10,6 +10,8 @@ Async Python library for persisting [AG-UI protocol](https://github.com/ag-ui-pr
 - Hierarchical runs: top-level runs and child (sub-agent) runs via `parent_run_id`
 - Cursor-based pagination for progressive history retrieval
 - Tracks run status (`running` / `completed` / `error`), title, and summary
+- `persist_on_completion` — hold all events in memory and write them atomically when the run reaches a terminal state
+- `merge_delta_events` — collapse consecutive streaming deltas for the same message/tool call into a single row before writing
 
 ## Installation
 
@@ -20,10 +22,10 @@ pip install ag-ui-persistence
 ## Usage
 
 ```python
-from ag_ui_persistence import AGUIPersistence
+from ag_ui_persistence import AGUIPersistence, PersistenceConfig
 
-store = AGUIPersistence("sqlite:///agui.db")
-# or: AGUIPersistence("postgresql://user:pass@localhost/mydb")
+store = AGUIPersistence(PersistenceConfig(db_url="sqlite:///agui.db"))
+# or: AGUIPersistence(PersistenceConfig(db_url="postgresql://user:pass@localhost/mydb"))
 await store.initialize()  # creates tables
 
 # During a live agent run
@@ -42,13 +44,82 @@ while run:
 # Child (sub-agent) runs
 await store.put_run(thread_id="t1", run_id="r1-sub", parent_run_id="r1")
 child_runs = await store.get_runs(thread_id="t1", parent_run_id="r1")
+
+await store.close()
+```
+
+## Configuration
+
+All options are passed via `PersistenceConfig`:
+
+```python
+store = AGUIPersistence(PersistenceConfig(
+    db_url="sqlite:///agui.db",        # SQLite or PostgreSQL URL
+    # engine=my_async_engine,          # or pass an existing AsyncEngine directly
+    enable_event_buffering=True,       # buffer events for batched writes (default: True)
+    event_batch_size=200,              # flush when this many events are buffered per run
+    event_flush_interval=0.02,         # flush after this many seconds of inactivity
+    persist_on_completion=True,        # hold all events until run reaches terminal status
+    merge_delta_events=True,           # collapse consecutive deltas for the same message/tool call
+))
+```
+
+### `persist_on_completion`
+
+When `True`, all events for a run are held in memory and written to the database only when `update_run()` is called with a terminal status (`completed` or `error`). `get_events()` returns an empty list while the run is still in progress.
+
+This is useful when you want atomic, all-or-nothing event persistence — e.g. only store a run's events if it completes successfully.
+
+```python
+store = AGUIPersistence(PersistenceConfig(db_url="sqlite:///agui.db", persist_on_completion=True))
+await store.initialize()
+
+await store.put_run("t1", "r1", parent_run_id=None)
+await store.put_event("r1", 0, "RUN_STARTED", {})
+await store.put_event("r1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "m1", "delta": "Hello"})
+
+events = await store.get_events("r1")  # [] — not written yet
+
+await store.update_run("r1", status="completed")
+
+events = await store.get_events("r1")  # [RUN_STARTED, TEXT_MESSAGE_CONTENT]
+```
+
+### `merge_delta_events`
+
+When `True`, consecutive streaming delta events for the same message or tool call are merged into a single database row before writing. Supported event types:
+
+- `TEXT_MESSAGE_CONTENT` — deltas grouped by `messageId`; `delta` fields concatenated
+- `TOOL_CALL_ARGS` — deltas grouped by `toolCallId`; `delta` fields concatenated
+
+The merged row keeps the `seq` of the first delta in the group. `started_at` comes from the first delta and `ended_at` from the last, capturing the full duration of the streaming sequence.
+
+```python
+store = AGUIPersistence(PersistenceConfig(db_url="sqlite:///agui.db", merge_delta_events=True))
+await store.initialize()
+
+await store.put_run("t1", "r1", parent_run_id=None)
+await store.put_event("r1", 0, "TEXT_MESSAGE_CONTENT", {"messageId": "m1", "delta": "Hello"})
+await store.put_event("r1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "m1", "delta": ", "})
+await store.put_event("r1", 2, "TEXT_MESSAGE_CONTENT", {"messageId": "m1", "delta": "world"})
+
+events = await store.get_events("r1")
+# [Event(seq=0, event_type="TEXT_MESSAGE_CONTENT", data={"messageId": "m1", "delta": "Hello, world"})]
 ```
 
 ## API
 
-### `AGUIPersistence(engine)`
+### `AGUIPersistence(config: PersistenceConfig)`
 
-Accepts a SQLAlchemy URL string or an existing `AsyncEngine`. `sqlite://` and `postgresql://` / `postgres://` prefixes are automatically converted to their async-native equivalents (`sqlite+aiosqlite://`, `postgresql+asyncpg://`).
+All configuration — connection details and behaviour — is passed via a single `PersistenceConfig` dataclass.
+
+Set `db_url` to a SQLAlchemy URL string, or `engine` to pass an existing `AsyncEngine` directly (in which case the engine is never disposed on `close()`). `sqlite://` and `postgresql://` / `postgres://` URL prefixes are automatically converted to their async-native equivalents (`sqlite+aiosqlite://`, `postgresql+asyncpg://`). Exactly one of `db_url` or `engine` must be provided.
+
+When `enable_event_buffering=True` (the default), `put_event()` uses an internal async buffer and `get_events()` flushes buffered events for the requested run before reading, so event reads stay fresh while write throughput improves.
+
+When `enable_event_buffering=False`, `put_event()` writes directly to the database and `get_events()` performs a normal DB read without any internal flush.
+
+`persist_on_completion=True` implies buffering is always active regardless of `enable_event_buffering`.
 
 #### Write
 
@@ -56,8 +127,9 @@ Accepts a SQLAlchemy URL string or an existing `AsyncEngine`. `sqlite://` and `p
 |---|---|
 | `initialize()` | Create tables (idempotent) |
 | `put_run(thread_id, run_id, parent_run_id, title?, status?, namespace?, user_message?)` | Upsert thread + insert run; maintains `latest_run_id` / `previous_run_id` linked list for top-level runs |
-| `put_event(run_id, seq, event_type, data)` | Persist one event (duplicate-safe) |
-| `update_run(run_id, status, summary?)` | Update run status and optional summary |
+| `put_event(run_id, seq, event_type, data)` | Buffer one event for batched persistence (duplicate-safe on flush) |
+| `update_run(run_id, status, summary?)` | Update run status and optional summary; triggers event flush for terminal statuses |
+| `close()` | Flush pending events and dispose the engine |
 
 #### Read
 
@@ -91,6 +163,8 @@ Event
   run_id + seq    — composite primary key
   event_type      — AG-UI event type (e.g. TEXT_MESSAGE_START, TOOL_CALL_START)
   data            — JSON payload
+  started_at      — millisecond timestamp when the event (or first delta) was received
+  ended_at        — millisecond timestamp when the last delta was received (equals started_at for non-delta events)
 ```
 
 ## Running Tests
