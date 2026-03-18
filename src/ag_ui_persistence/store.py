@@ -1,8 +1,8 @@
 import asyncio
+import contextlib
 import json
 import time
-from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy import event as sa_event, text
@@ -88,6 +88,32 @@ class _BufferedEvent:
     enqueued_at: float
 
 
+@dataclass(slots=True)
+class _RunState:
+    run_id: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    lock_waiter_count: int = 0
+    pending_events: list[_BufferedEvent] = field(default_factory=list)
+    inflight_event_token: int = 0
+    flush_waiters: list[tuple[int, asyncio.Future[None]]] = field(default_factory=list)
+    next_event_token: int = 0
+    committed_event_token: int = 0
+    flush_requested: bool = False
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        """Acquire state.lock while keeping lock_waiter_count balanced under cancellation."""
+        self.lock_waiter_count += 1
+        try:
+            await self.lock.acquire()
+        finally:
+            self.lock_waiter_count -= 1
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+
 class AGUIPersistence:
     def __init__(self, config: PersistenceConfig):
         if config.engine is not None:
@@ -105,15 +131,10 @@ class AGUIPersistence:
         self._event_flush_interval = config.event_flush_interval
         self._persist_on_completion = config.persist_on_completion
         self._merge_delta_events = config.merge_delta_events
-        self._pending_events: dict[str, list[_BufferedEvent]] = defaultdict(list)
-        self._inflight_event_tokens: dict[str, int] = {}
-        self._flush_waiters: dict[str, list[tuple[int, asyncio.Future[None]]]] = defaultdict(list)
-        self._next_event_token: dict[str, int] = defaultdict(int)
-        self._committed_event_token: dict[str, int] = defaultdict(int)
+        self._run_states: dict[str, _RunState] = {}
         self._buffer_write_error: Optional[Exception] = None
-        self._flush_requested_runs: set[str] = set()
-        self._state_lock = asyncio.Lock()
         self._state_changed = asyncio.Event()
+        self._flusher_lock = asyncio.Lock()
         self._flusher_task: Optional[asyncio.Task[None]] = None
         self._closing = False
         self._closed = False
@@ -146,17 +167,17 @@ class AGUIPersistence:
             return
         self._closing = True
         failure: Optional[Exception] = self._buffer_write_error
-        async with self._state_lock:
-            if self._pending_events:
+        for state in list(self._run_states.values()):
+            async with state.acquire():
                 if self._persist_on_completion:
-                    # Discard events for runs that never reached a terminal status
-                    for run_id in [r for r in self._pending_events if r not in self._flush_requested_runs]:
-                        del self._pending_events[run_id]
-                else:
-                    self._flush_requested_runs.update(self._pending_events)
-                if self._pending_events:
-                    self._ensure_flusher_locked()
-            self._state_changed.set()
+                    # Preserve events for runs that already have a flush in flight (e.g. via
+                    # delete_thread); only discard runs that were never marked for flushing.
+                    if not state.flush_requested:
+                        state.pending_events.clear()
+                elif state.pending_events:
+                    state.flush_requested = True
+        await self._ensure_flusher_locked()
+        self._state_changed.set()
         try:
             await self._flush_all_events()
         except Exception as exc:
@@ -268,15 +289,16 @@ class AGUIPersistence:
             token=0,
             enqueued_at=time.monotonic(),
         )
-        async with self._state_lock:
+        state = self._get_run_state(run_id)
+        async with state.acquire():
             self._ensure_open()
-            self._ensure_flusher_locked()
-            self._next_event_token[run_id] += 1
-            event.token = self._next_event_token[run_id]
-            self._pending_events[run_id].append(event)
-            if not self._persist_on_completion and len(self._pending_events[run_id]) >= self._event_batch_size:
-                self._flush_requested_runs.add(run_id)
-            self._state_changed.set()
+            state.next_event_token += 1
+            event.token = state.next_event_token
+            state.pending_events.append(event)
+            if not self._persist_on_completion and len(state.pending_events) >= self._event_batch_size:
+                state.flush_requested = True
+        await self._ensure_flusher_locked()
+        self._state_changed.set()
 
     async def update_run(
         self,
@@ -484,40 +506,57 @@ class AGUIPersistence:
         if namespace is not None:
             if not await self._run_matches_namespace(run_id, namespace):
                 return []
-        # With persist_on_completion, events are only written on terminal status — don't flush here
+        # Two paths diverge here based on persist_on_completion:
+        # - False: events are flushed to DB eagerly, so the DB is authoritative. Flush
+        #   any outstanding events first, then read directly from DB.
+        # - True: events may never reach the DB until run completion. Read from the
+        #   in-memory buffer (merged with any already-committed DB rows) so callers
+        #   always see a complete snapshot regardless of run status.
         if self._enable_event_buffering and not self._persist_on_completion:
             await self._flush_run(run_id)
-        async with self._engine.connect() as conn:
-            join = ""
-            namespace_filter = ""
-            params = {"rid": run_id}
-            if namespace is not None:
-                join = (
-                    " JOIN agui_runs r ON r.run_id = agui_events.run_id"
-                    " JOIN agui_threads t ON t.thread_id = r.thread_id"
-                )
-                namespace_filter = " AND t.namespace = :ns"
-                params["ns"] = namespace
-            result = await conn.execute(
-                text(
-                    "SELECT agui_events.run_id, agui_events.seq, agui_events.event_type, "
-                    "agui_events.data, agui_events.started_at, agui_events.ended_at "
-                    f"FROM agui_events{join} WHERE agui_events.run_id = :rid{namespace_filter} "
-                    "ORDER BY agui_events.seq ASC"
-                ),
-                params,
-            )
-            return [
-                Event(
-                    run_id=r[0],
-                    seq=r[1],
-                    event_type=r[2],
-                    data=json.loads(r[3]),
-                    started_at=r[4],
-                    ended_at=r[5],
-                )
-                for r in result
-            ]
+        if not self._persist_on_completion:
+            return await self._read_db_events(run_id, namespace)
+        state = self._run_states.get(run_id)
+        if state is None:
+            return await self._read_db_events(run_id, namespace)
+        while True:
+            waiter: Optional[asyncio.Future[None]] = None
+            pending_snapshot: Optional[list[_BufferedEvent]] = None
+            async with state.acquire():
+                if state.inflight_event_token > state.committed_event_token:
+                    # Events moved out of pending_events into an in-flight batch are not in
+                    # DB yet. Wait for that flush to commit before reading, so we never return
+                    # a snapshot with a gap in the middle of the event sequence.
+                    waiter = asyncio.get_running_loop().create_future()
+                    state.flush_waiters.append((state.inflight_event_token, waiter))
+                else:
+                    # Snapshot pending_events under the lock, then release before the DB
+                    # read so that concurrent put_event() / _flush_run_atomic() / the
+                    # background flusher are not serialized behind the DB round-trip.
+                    pending_snapshot = list(state.pending_events)
+                    if not pending_snapshot:
+                        self._prune_run_state_locked(run_id, state)
+            if waiter is not None:
+                await waiter
+                continue
+            if pending_snapshot is not None:
+                db_events = await self._read_db_events(run_id, namespace)
+                if not pending_snapshot:
+                    return db_events
+                buffered = self._do_merge_delta_events(pending_snapshot) if self._merge_delta_events else pending_snapshot
+                events = db_events + [
+                    Event(
+                        run_id=e.run_id,
+                        seq=e.seq,
+                        event_type=e.event_type,
+                        data=json.loads(e.data_json),
+                        started_at=e.started_at,
+                        ended_at=e.ended_at,
+                    )
+                    for e in buffered
+                ]
+                events.sort(key=lambda event: event.seq)
+                return events
 
     async def _run_matches_namespace(self, run_id: str, namespace: str) -> bool:
         async with self._engine.connect() as conn:
@@ -532,9 +571,10 @@ class AGUIPersistence:
             )
             return result.fetchone() is not None
 
-    def _ensure_flusher_locked(self) -> None:
-        if self._flusher_task is None or self._flusher_task.done():
-            self._flusher_task = asyncio.create_task(self._event_flusher_loop())
+    async def _ensure_flusher_locked(self) -> None:
+        async with self._flusher_lock:
+            if self._flusher_task is None or self._flusher_task.done():
+                self._flusher_task = asyncio.create_task(self._event_flusher_loop())
 
     def _ensure_open(self) -> None:
         if self._closed or self._closing:
@@ -550,101 +590,104 @@ class AGUIPersistence:
         Called by update_run() when persist_on_completion=True so that events and the
         run status are always committed together or not at all.
         """
-        async with self._state_lock:
-            events = self._pending_events.pop(run_id, [])
-            self._flush_requested_runs.discard(run_id)
-            self._state_changed.set()
+        state = self._get_run_state(run_id)
+        # The lock is held across the DB transaction so that get_events sees a consistent
+        # snapshot (either all events in memory or all committed). This is acceptable because
+        # get_events is a history API and is not expected to be on the live event flow.
+        async with state.acquire():
+            events = self._do_merge_delta_events(state.pending_events) if self._merge_delta_events else list(state.pending_events)
+            rows = [
+                {
+                    "rid": e.run_id, "seq": e.seq, "etype": e.event_type,
+                    "data": e.data_json, "started_at": e.started_at, "ended_at": e.ended_at,
+                }
+                for e in events
+            ]
 
-        if self._merge_delta_events:
-            events = self._do_merge_delta_events(events)
-
-        rows = [
-            {
-                "rid": e.run_id, "seq": e.seq, "etype": e.event_type,
-                "data": e.data_json, "started_at": e.started_at, "ended_at": e.ended_at,
-            }
-            for e in events
-        ]
-
-        async with self._engine.begin() as conn:
-            if rows:
+            async with self._engine.begin() as conn:
+                if rows:
+                    await conn.execute(
+                        text(
+                            "INSERT INTO agui_events (run_id, seq, event_type, data, started_at, ended_at) "
+                            "VALUES (:rid, :seq, :etype, :data, :started_at, :ended_at) "
+                            "ON CONFLICT (run_id, seq) DO NOTHING"
+                        ),
+                        rows,
+                    )
                 await conn.execute(
                     text(
-                        "INSERT INTO agui_events (run_id, seq, event_type, data, started_at, ended_at) "
-                        "VALUES (:rid, :seq, :etype, :data, :started_at, :ended_at) "
-                        "ON CONFLICT (run_id, seq) DO NOTHING"
+                        "UPDATE agui_runs SET status = :status, summary = :summary, updated_at = :now "
+                        "WHERE run_id = :rid"
                     ),
-                    rows,
+                    {"rid": run_id, "status": status, "summary": summary, "now": now},
                 )
-            await conn.execute(
-                text(
-                    "UPDATE agui_runs SET status = :status, summary = :summary, updated_at = :now "
-                    "WHERE run_id = :rid"
-                ),
-                {"rid": run_id, "status": status, "summary": summary, "now": now},
-            )
-            await conn.execute(
-                text(
-                    "UPDATE agui_threads SET updated_at = :now "
-                    "WHERE thread_id = (SELECT thread_id FROM agui_runs WHERE run_id = :rid)"
-                ),
-                {"rid": run_id, "now": now},
-            )
-
-        if events:
-            async with self._state_lock:
-                self._committed_event_token[run_id] = max(
-                    self._committed_event_token.get(run_id, 0), events[-1].token
+                await conn.execute(
+                    text(
+                        "UPDATE agui_threads SET updated_at = :now "
+                        "WHERE thread_id = (SELECT thread_id FROM agui_runs WHERE run_id = :rid)"
+                    ),
+                    {"rid": run_id, "now": now},
                 )
-                waiters = self._flush_waiters.pop(run_id, [])
-            for _, future in waiters:
-                if not future.done():
-                    future.set_result(None)
+            state.pending_events.clear()
+            state.flush_requested = False
+            if events:
+                state.committed_event_token = max(state.committed_event_token, events[-1].token)
+                waiters = state.flush_waiters
+                state.flush_waiters = []
+                for _, future in waiters:
+                    if not future.done():
+                        future.set_result(None)
+            self._prune_run_state_locked(run_id, state)
 
     async def _flush_run(self, run_id: str) -> None:
         self._ensure_open()
+        state = self._run_states.get(run_id)
+        if state is None:
+            return
         waiter: Optional[asyncio.Future[None]] = None
-        async with self._state_lock:
-            target_token = self._next_event_token.get(run_id, 0)
-            if self._committed_event_token.get(run_id, 0) >= target_token:
+        async with state.acquire():
+            target_token = max(state.next_event_token, state.inflight_event_token)
+            if state.committed_event_token >= target_token:
                 return
-            self._ensure_flusher_locked()
             waiter = asyncio.get_running_loop().create_future()
-            self._flush_waiters[run_id].append((target_token, waiter))
-            self._flush_requested_runs.add(run_id)
-            self._state_changed.set()
+            state.flush_waiters.append((target_token, waiter))
+            state.flush_requested = True
+        await self._ensure_flusher_locked()
+        self._state_changed.set()
         await waiter
 
     async def _flush_all_events(self) -> None:
         if self._closed:
             return
-        async with self._state_lock:
-            run_ids = set(self._pending_events) | set(self._inflight_event_tokens)
+        run_ids: set[str] = set()
+        for run_id, state in list(self._run_states.items()):
+            if state.pending_events or state.inflight_event_token:
+                run_ids.add(run_id)
         await self._flush_runs(run_ids)
 
     async def _flush_runs(self, run_ids: set[str]) -> None:
         if self._closed or not run_ids:
             return
-        async with self._state_lock:
-            targets: dict[str, int] = {}
-            for run_id in run_ids:
-                target_token = max(
-                    self._next_event_token.get(run_id, 0),
-                    self._inflight_event_tokens.get(run_id, 0),
-                )
-                if self._committed_event_token.get(run_id, 0) < target_token:
-                    targets[run_id] = target_token
-            if not targets:
-                return
-            self._ensure_flusher_locked()
-            waiters: list[asyncio.Future[None]] = []
-            loop = asyncio.get_running_loop()
-            for run_id, target_token in targets.items():
+        targets: dict[str, int] = {}
+        waiters: list[asyncio.Future[None]] = []
+        loop = asyncio.get_running_loop()
+        for run_id in run_ids:
+            state = self._run_states.get(run_id)
+            if state is None:
+                continue
+            async with state.acquire():
+                target_token = max(state.next_event_token, state.inflight_event_token)
+                if state.committed_event_token >= target_token:
+                    continue
                 waiter = loop.create_future()
-                self._flush_waiters[run_id].append((target_token, waiter))
-                self._flush_requested_runs.add(run_id)
+                state.flush_waiters.append((target_token, waiter))
+                state.flush_requested = True
+                targets[run_id] = target_token
                 waiters.append(waiter)
-            self._state_changed.set()
+        if not targets:
+            return
+        await self._ensure_flusher_locked()
+        self._state_changed.set()
         await asyncio.gather(*waiters)
 
     async def _get_thread_run_ids(self, thread_id: str, namespace: Optional[str]) -> set[str]:
@@ -671,61 +714,74 @@ class AGUIPersistence:
             stop_error = exc
             raise
         finally:
-            async with self._state_lock:
+            async with self._flusher_lock:
                 is_active_flusher = self._flusher_task is asyncio.current_task()
                 if is_active_flusher:
                     self._flusher_task = None
-                if is_active_flusher and stop_error is not None:
-                    for waiters in self._flush_waiters.values():
+            if is_active_flusher and stop_error is not None:
+                for state in list(self._run_states.values()):
+                    async with state.acquire():
+                        waiters = state.flush_waiters
+                        state.flush_waiters = []
                         for _, future in waiters:
                             if not future.done():
                                 future.set_exception(RuntimeError("Event flusher stopped"))
-                    self._flush_waiters.clear()
 
     async def _next_flush_batch(self) -> Optional[dict[str, list[_BufferedEvent]]]:
         while True:
-            async with self._state_lock:
-                if not self._pending_events:
-                    self._state_changed.clear()
+            # Clear _state_changed *before* iterating run states so that any put_event()
+            # that fires during the loop (at an await point inside state.acquire()) sets
+            # the event again — we'll catch it via the `if self._state_changed.is_set():
+            # continue` guards below rather than sleeping through the flush interval.
+            self._state_changed.clear()
+            has_pending = False
+            # Snapshot the dict so mutations from _get_run_state/_prune_run_state_locked
+            # during iteration (across await points) don't affect this pass.
+            batch: dict[str, list[_BufferedEvent]] = {}
+            for run_id, state in list(self._run_states.items()):
+                async with state.acquire():
+                    if state.pending_events:
+                        has_pending = True
+                    if not self._run_is_ready_locked(state):
+                        continue
+                    events = list(state.pending_events)
+                    state.pending_events.clear()
+                    state.inflight_event_token = events[-1].token
+                    state.flush_requested = False
+                    batch[run_id] = events
+            if batch:
+                return batch
+            if not has_pending:
+                async with self._flusher_lock:
+                    # If _state_changed was set after we cleared it, a concurrent put_event
+                    # saw us as still running and skipped starting a replacement. Loop back
+                    # to pick up those events rather than exiting and leaving them stranded.
+                    if self._state_changed.is_set():
+                        continue
                     if self._flusher_task is asyncio.current_task():
                         self._flusher_task = None
-                    return None
-                ready_runs = self._get_ready_runs_locked()
-                if ready_runs:
-                    batch = {run_id: self._pending_events.pop(run_id) for run_id in ready_runs}
-                    for run_id in ready_runs:
-                        self._inflight_event_tokens[run_id] = batch[run_id][-1].token
-                    self._flush_requested_runs.difference_update(ready_runs)
-                    if not self._pending_events:
-                        self._state_changed.clear()
-                    return batch
-                self._state_changed.clear()
+                return None
+            if self._state_changed.is_set():
+                continue
             try:
                 await asyncio.wait_for(self._state_changed.wait(), timeout=self._event_flush_interval)
             except asyncio.TimeoutError:
                 continue
 
-    def _get_ready_runs_locked(self) -> list[str]:
-        if not self._pending_events:
-            return []
+    def _run_is_ready_locked(self, state: _RunState) -> bool:
+        if not state.pending_events:
+            return False
         if self._closing:
             if self._persist_on_completion:
-                return [r for r in self._pending_events if r in self._flush_requested_runs]
-            return list(self._pending_events)
+                return state.flush_requested
+            return True
         if self._persist_on_completion:
-            return [r for r in self._pending_events if r in self._flush_requested_runs]
-        now = time.monotonic()
-        ready_runs: list[str] = []
-        for run_id, events in self._pending_events.items():
-            if run_id in self._flush_requested_runs:
-                ready_runs.append(run_id)
-                continue
-            if len(events) >= self._event_batch_size:
-                ready_runs.append(run_id)
-                continue
-            if events and (now - events[0].enqueued_at) >= self._event_flush_interval:
-                ready_runs.append(run_id)
-        return ready_runs
+            return state.flush_requested
+        if state.flush_requested:
+            return True
+        if len(state.pending_events) >= self._event_batch_size:
+            return True
+        return (time.monotonic() - state.pending_events[0].enqueued_at) >= self._event_flush_interval
 
     @staticmethod
     def _delta_key(event: _BufferedEvent) -> Optional[tuple[str, str]]:
@@ -865,42 +921,84 @@ class AGUIPersistence:
                 if first_error is not None:
                     raise first_error
                 return
-            async with self._state_lock:
-                if self._buffer_write_error is None:
-                    self._buffer_write_error = exc
-                for run_id, events in batch.items():
-                    self._inflight_event_tokens.pop(run_id, None)
-                    waiters = self._flush_waiters.get(run_id, [])
+            for run_id, events in batch.items():
+                state = self._get_run_state(run_id)
+                async with state.acquire():
+                    if self._buffer_write_error is None:
+                        self._buffer_write_error = exc
+                    state.inflight_event_token = 0
                     remaining_waiters: list[tuple[int, asyncio.Future[None]]] = []
                     max_failed_token = events[-1].token
-                    for target_token, future in waiters:
+                    for target_token, future in state.flush_waiters:
                         if target_token <= max_failed_token and not future.done():
                             future.set_exception(exc)
                         else:
                             remaining_waiters.append((target_token, future))
-                    if remaining_waiters:
-                        self._flush_waiters[run_id] = remaining_waiters
-                    else:
-                        self._flush_waiters.pop(run_id, None)
-                self._state_changed.set()
+                    state.flush_waiters = remaining_waiters
+            self._state_changed.set()
             raise
 
-        async with self._state_lock:
-            for run_id, events in batch.items():
-                self._inflight_event_tokens.pop(run_id, None)
-                self._committed_event_token[run_id] = max(
-                    self._committed_event_token.get(run_id, 0),
+        for run_id, events in batch.items():
+            state = self._get_run_state(run_id)
+            async with state.acquire():
+                state.inflight_event_token = 0
+                state.committed_event_token = max(
+                    state.committed_event_token,
                     events[-1].token,
                 )
-                waiters = self._flush_waiters.get(run_id, [])
                 remaining_waiters: list[tuple[int, asyncio.Future[None]]] = []
-                for target_token, future in waiters:
-                    if target_token <= self._committed_event_token[run_id]:
+                for target_token, future in state.flush_waiters:
+                    if target_token <= state.committed_event_token:
                         if not future.done():
                             future.set_result(None)
                     else:
                         remaining_waiters.append((target_token, future))
-                if remaining_waiters:
-                    self._flush_waiters[run_id] = remaining_waiters
-                else:
-                    self._flush_waiters.pop(run_id, None)
+                state.flush_waiters = remaining_waiters
+                self._prune_run_state_locked(run_id, state)
+
+    def _get_run_state(self, run_id: str) -> _RunState:
+        return self._run_states.setdefault(run_id, _RunState(run_id=run_id))
+
+    def _prune_run_state_locked(self, run_id: str, state: _RunState) -> None:
+        """Remove run_id from _run_states if fully idle. Must be called while holding state.lock.
+
+        We intentionally skip pruning when other coroutines are blocked waiting for the lock.
+        They already hold a reference to this _RunState and will append events after they
+        acquire the lock; pruning now would orphan those events from _next_flush_batch.
+        """
+        if (not state.pending_events and state.inflight_event_token == 0 and not state.flush_waiters
+                and state.lock_waiter_count == 0):
+            self._run_states.pop(run_id, None)
+
+    async def _read_db_events(self, run_id: str, namespace: Optional[str]) -> list[Event]:
+        async with self._engine.connect() as conn:
+            join = ""
+            namespace_filter = ""
+            params = {"rid": run_id}
+            if namespace is not None:
+                join = (
+                    " JOIN agui_runs r ON r.run_id = agui_events.run_id"
+                    " JOIN agui_threads t ON t.thread_id = r.thread_id"
+                )
+                namespace_filter = " AND t.namespace = :ns"
+                params["ns"] = namespace
+            result = await conn.execute(
+                text(
+                    "SELECT agui_events.run_id, agui_events.seq, agui_events.event_type, "
+                    "agui_events.data, agui_events.started_at, agui_events.ended_at "
+                    f"FROM agui_events{join} WHERE agui_events.run_id = :rid{namespace_filter} "
+                    "ORDER BY agui_events.seq ASC"
+                ),
+                params,
+            )
+            return [
+                Event(
+                    run_id=r[0],
+                    seq=r[1],
+                    event_type=r[2],
+                    data=json.loads(r[3]),
+                    started_at=r[4],
+                    ended_at=r[5],
+                )
+                for r in result
+            ]

@@ -484,8 +484,7 @@ async def test_enqueue_during_idle_flusher_exit_starts_replacement_flusher():
         await store.get_events("run-1")
 
         old_task = asyncio.create_task(store._event_flusher_loop())
-        async with store._state_lock:
-            store._flusher_task = old_task
+        store._flusher_task = old_task
 
         await asyncio.sleep(0)
         await store.put_event("run-1", 1, "TEXT_MESSAGE_END", {"threadId": "thread-1"})
@@ -564,7 +563,7 @@ async def test_missing_db_url_and_engine_raises():
 # ------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_persist_on_completion_events_not_visible_until_complete():
+async def test_persist_on_completion_get_events_returns_buffered_events():
     store = mem_store(persist_on_completion=True)
     await store.initialize()
     try:
@@ -580,9 +579,11 @@ async def test_persist_on_completion_events_not_visible_until_complete():
             )
             assert result.scalar() == 0
 
-        # get_events should return empty (no flush triggered)
+        # get_events should return the in-memory buffered events without flushing them
         events = await store.get_events("run-1")
-        assert events == []
+        assert [event.seq for event in events] == [0, 1]
+        assert events[0].event_type == "RUN_STARTED"
+        assert events[1].event_type == "TEXT_MESSAGE_START"
 
         # DB still empty after get_events
         async with store._engine.connect() as conn:
@@ -606,6 +607,132 @@ async def test_persist_on_completion_events_not_visible_until_complete():
         events = await store.get_events("run-1")
         assert len(events) == 2
         assert events[0].event_type == "RUN_STARTED"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_get_events_merges_buffered_deltas():
+    store = mem_store(persist_on_completion=True, merge_delta_events=True)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "Hello"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": ", "})
+        await store.put_event("run-1", 2, "TEXT_MESSAGE_CONTENT", {"messageId": "msg-1", "delta": "world"})
+        await store.put_event("run-1", 3, "TEXT_MESSAGE_END", {"messageId": "msg-1"})
+
+        events = await store.get_events("run-1")
+
+        assert len(events) == 2
+        assert events[0].event_type == "TEXT_MESSAGE_CONTENT"
+        assert events[0].seq == 0
+        assert events[0].data["delta"] == "Hello, world"
+        assert events[1].event_type == "TEXT_MESSAGE_END"
+    finally:
+        await store.close()
+
+
+def _stall_engine_begin(store):
+    """Wrap store._engine so the first begin() stalls until the returned release event is set.
+
+    Returns (started, release): started is set when the DB transaction has been entered;
+    release must be set by the caller to let it proceed.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_begin = store._engine.begin
+
+    class ControlledBegin:
+        def __init__(self, cm):
+            self._cm = cm
+
+        async def __aenter__(self_inner):
+            conn = await self_inner._cm.__aenter__()
+            started.set()
+            await release.wait()
+            return conn
+
+        async def __aexit__(self_inner, exc_type, exc, tb):
+            return await self_inner._cm.__aexit__(exc_type, exc, tb)
+
+    class EngineProxy:
+        def __init__(self, engine):
+            self._engine = engine
+
+        def begin(self):
+            return ControlledBegin(original_begin())
+
+        def __getattr__(self, name):
+            return getattr(self._engine, name)
+
+    store._engine = EngineProxy(store._engine)
+    return started, release
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_get_events_waits_for_same_run_atomic_finalize():
+    store = mem_store(persist_on_completion=True)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+
+        started, release = _stall_engine_begin(store)
+
+        update_task = asyncio.create_task(store.update_run("run-1", status="completed"))
+        await started.wait()
+
+        read_task = asyncio.create_task(store.get_events("run-1"))
+        await asyncio.sleep(0)
+        assert not read_task.done()
+
+        release.set()
+        await update_task
+        events = await read_task
+
+        assert [event.seq for event in events] == [0]
+        assert events[0].event_type == "RUN_STARTED"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_on_completion_get_events_waits_for_inflight_background_flush():
+    """get_events must not return a snapshot with a gap when a background flush is in-flight.
+
+    Regression test for the bug where pending_events being empty (events moved to an
+    in-flight batch by the background flusher) caused get_events to return only DB events
+    before the batch committed, dropping the newest events entirely.
+    """
+    store = mem_store(persist_on_completion=True)
+    await store.initialize()
+    try:
+        await store.put_run("thread-1", "run-1", parent_run_id=None)
+        await store.put_event("run-1", 0, "RUN_STARTED", {"threadId": "thread-1"})
+        await store.put_event("run-1", 1, "TEXT_MESSAGE_START", {"messageId": "msg-1"})
+
+        started, release = _stall_engine_begin(store)
+
+        # _flush_run marks flush_requested=True, starts the background flusher, and
+        # waits for commit.  The flusher will move events out of pending_events into the
+        # in-flight batch and then pause inside begin() before committing.
+        flush_task = asyncio.create_task(store._flush_run("run-1"))
+        await started.wait()  # flusher has taken events; pending_events is now empty
+
+        # At this point: inflight_event_token > 0, pending_events == [], DB still empty.
+        # get_events must wait for the flush rather than returning stale/empty history.
+        read_task = asyncio.create_task(store.get_events("run-1"))
+        await asyncio.sleep(0)
+        assert not read_task.done()
+
+        release.set()
+        await flush_task
+        events = await read_task
+
+        assert [event.seq for event in events] == [0, 1]
+        assert events[0].event_type == "RUN_STARTED"
+        assert events[1].event_type == "TEXT_MESSAGE_START"
     finally:
         await store.close()
 
