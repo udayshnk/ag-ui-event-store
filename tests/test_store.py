@@ -520,26 +520,6 @@ async def test_run_seq_increments(store):
 
 
 @pytest.mark.asyncio
-async def test_title_and_user_message_stored(store):
-    msg = "Hello, this is my first user message"
-    await store.put_run("thread-1", "run-1", parent_run_id=None, title=msg[:100], user_message=msg)
-    threads = await store.get_threads()
-    assert threads[0].user_message == msg
-    assert threads[0].title == msg[:100]
-
-
-@pytest.mark.asyncio
-async def test_user_message_not_overwritten(store):
-    first = "First user message"
-    second = "Second user message"
-    await store.put_run("thread-1", "run-1", parent_run_id=None, title=first[:100], user_message=first)
-    await store.put_run("thread-1", "run-2", parent_run_id=None, title=second[:100], user_message=second)
-    threads = await store.get_threads()
-    assert threads[0].user_message == first
-    assert threads[0].title == first[:100]
-
-
-@pytest.mark.asyncio
 async def test_delete_thread_respects_namespace(store):
     await store.put_run("thread-1", "run-1", parent_run_id=None, namespace="project-a")
 

@@ -37,9 +37,6 @@ _DDL = """
 CREATE TABLE IF NOT EXISTS agui_threads (
     thread_id     TEXT PRIMARY KEY,
     namespace     TEXT,
-    agent_id      TEXT,
-    title         TEXT,
-    user_message  TEXT,
     latest_run_id TEXT,
     created_at    BIGINT NOT NULL,
     updated_at    BIGINT NOT NULL
@@ -203,20 +200,18 @@ class AGUIPersistence:
         title: Optional[str] = None,
         status: str = "running",
         namespace: Optional[str] = None,
-        user_message: Optional[str] = None,
-        agent_id: Optional[str] = None,
     ) -> None:
         self._ensure_open()
         now = int(time.time() * 1000)
         async with self._engine.begin() as conn:
-            # Upsert thread — namespace, agent_id, title, user_message only written on first insert
+            # Upsert thread — namespace only written on first insert
             await conn.execute(
                 text(
-                    "INSERT INTO agui_threads (thread_id, namespace, agent_id, title, user_message, created_at, updated_at) "
-                    "VALUES (:tid, :ns, :agent_id, :title, :user_message, :now, :now) "
+                    "INSERT INTO agui_threads (thread_id, namespace, created_at, updated_at) "
+                    "VALUES (:tid, :ns, :now, :now) "
                     "ON CONFLICT (thread_id) DO UPDATE SET updated_at = :now"
                 ),
-                {"tid": thread_id, "ns": namespace, "agent_id": agent_id, "title": title, "user_message": user_message, "now": now},
+                {"tid": thread_id, "ns": namespace, "now": now},
             )
             # For top-level runs, read current latest_run_id to form the linked list
             previous_run_id: Optional[str] = None
@@ -346,8 +341,7 @@ class AGUIPersistence:
             ns_params: dict = {"ns": namespace} if namespace is not None else {}
 
             _select = (
-                "SELECT t.thread_id, t.namespace, t.agent_id, t.title, t.user_message, "
-                "t.latest_run_id, t.created_at, t.updated_at "
+                "SELECT t.thread_id, t.namespace, t.latest_run_id, t.created_at, t.updated_at "
                 "FROM agui_threads t "
             )
             if before:
@@ -377,12 +371,9 @@ class AGUIPersistence:
                 Thread(
                     thread_id=r[0],
                     namespace=r[1],
-                    agent_id=r[2],
-                    title=r[3],
-                    user_message=r[4],
-                    latest_run_id=r[5],
-                    created_at=r[6],
-                    updated_at=r[7],
+                    latest_run_id=r[2],
+                    created_at=r[3],
+                    updated_at=r[4],
                 )
                 for r in result
             ]

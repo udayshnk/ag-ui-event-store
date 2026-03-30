@@ -126,7 +126,7 @@ When `enable_event_buffering=False`, `put_event()` writes directly to the databa
 | Method | Description |
 |---|---|
 | `initialize()` | Create tables (idempotent) |
-| `put_run(thread_id, run_id, parent_run_id, title?, status?, namespace?, user_message?)` | Upsert thread + insert run; maintains `latest_run_id` / `previous_run_id` linked list for top-level runs |
+| `put_run(thread_id, run_id, parent_run_id, title?, status?, namespace?)` | Upsert thread + insert run; maintains `latest_run_id` / `previous_run_id` linked list for top-level runs |
 | `put_event(run_id, seq, event_type, data)` | Buffer one event for batched persistence (duplicate-safe on flush) |
 | `update_run(run_id, status, summary?)` | Update run status and optional summary; triggers event flush for terminal statuses |
 | `close()` | Flush pending events and dispose the engine |
@@ -146,8 +146,6 @@ When `enable_event_buffering=False`, `put_event()` writes directly to the databa
 Thread
   thread_id       — primary key
   namespace       — optional partition key (e.g. project ID)
-  title           — set on first run
-  user_message    — first user message, set on first run
   latest_run_id   — pointer to the most recent top-level run (linked-list head)
 
 Run
